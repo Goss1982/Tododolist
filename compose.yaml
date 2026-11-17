@@ -1,0 +1,15 @@
+services:
+  tododolist:
+    build: .
+    restart: unless-stopped
+    init: true
+    environment:
+      TODOIST_API_TOKEN: ${TODOIST_API_TOKEN:?Add your Todoist API token to .env}
+      GOOGLE_TASK_LIST_ID: ${GOOGLE_TASK_LIST_ID:-@default}
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-60}
+      GOOGLE_TOKEN_FILE: /data/google-token.json
+      STATE_FILE: /data/sync.sqlite3
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./data:/data
+    # No web port or public domain needed: this is an outbound background worker.

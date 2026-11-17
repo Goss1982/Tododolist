@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ruff_cache/
+.env
+.env.*
+!.env.example
+data/
+secrets/
+credentials*.json
+client_secret*.json
+*token*.json
+*.sqlite3*
+build/
+dist/

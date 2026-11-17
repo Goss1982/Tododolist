@@ -1,0 +1,13 @@
+.git
+.venv
+.env
+.env.*
+data
+secrets
+tests
+__pycache__
+*.egg-info
+*.sqlite3*
+*token*.json
+credentials*.json
+client_secret*.json
