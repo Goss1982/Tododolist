@@ -3,9 +3,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tododolist.clients import BridgeError, RateLimited
+from tododolist.clients import BridgeError, CommandRejected, RateLimited
 from tododolist.state import State
-from tododolist.sync import make_command, sync_once
+from tododolist.sync import alert_once, make_command, sync_once
 
 
 def task(tid="one", **fields):
@@ -18,11 +18,13 @@ class FakeGoogle:
         self.completed = []
         self.fail_complete = set()
         self.on_get = None
+        self.reads = []
 
     def resolve_lists(self, selection):
         return [{"id": "real-list-id", "title": "My Tasks"}]
 
-    def tasks(self, list_id):
+    def tasks(self, list_id, updated_min=None):
+        self.reads.append(updated_min)
         return copy.deepcopy(list(self.data.values()))
 
     def get(self, list_id, tid):
@@ -45,14 +47,33 @@ class FakeTodoist:
     def __init__(self):
         self.receipts = {}
         self.calls = []
+        self.updates = []
+        self.alerts = []
+        self.labels = []
         self.fail_titles = set()
+        self.reject_updates = False
         self.lose_reply = False
         self.on_execute = None
+        self.project = "inbox-id"
 
     def inbox(self):
         return "inbox-id"
 
+    def destination(self):
+        return self.project
+
+    def ensure_label(self, name):
+        self.labels.append(name)
+
     def execute(self, command):
+        if command["type"] == "item_update":
+            if self.reject_updates:
+                raise CommandRejected("item not found")
+            self.updates.append(copy.deepcopy(command))
+            return None
+        if command["args"].get("priority") == 4:
+            self.alerts.append(copy.deepcopy(command))
+            return "alert"
         self.calls.append(copy.deepcopy(command))
         if self.on_execute:
             self.on_execute(command)
@@ -172,24 +193,125 @@ class SyncTests(unittest.TestCase):
         self.sync(google)
         self.assertEqual(google.completed, [])
 
-    def test_changed_task_on_retry_stays_open_without_duplicate(self):
+    def test_edited_task_updates_todoist_copy_then_completes(self):
+        google = FakeGoogle([task(due="2026-11-18T00:00:00Z")])
+        google.fail_complete.add("one")
+        self.sync(google)
+        google.fail_complete.clear()
+        google.data["one"]["title"] = "Edited"
+        del google.data["one"]["due"]
+        result = self.sync(google)
+        self.assertEqual((result.updated, result.completed, result.errors), (1, 1, 0))
+        self.assertEqual(len(self.todoist.calls), 1)  # No duplicate copy.
+        args = self.todoist.updates[0]["args"]
+        self.assertEqual(args["id"], "todo-" + self.todoist.calls[0]["uuid"])
+        self.assertEqual(args["content"], "Edited")
+        self.assertIsNone(args["due"])  # Removed date is cleared in Todoist too.
+        self.assertEqual(google.completed, ["one"])
+
+    def test_edit_that_todoist_rejects_is_reported_once(self):
         google = FakeGoogle([task()])
         google.fail_complete.add("one")
         self.sync(google)
         google.fail_complete.clear()
         google.data["one"]["title"] = "Edited"
-        result = self.sync(google)
-        self.assertEqual(result.errors, 1)
-        self.assertEqual(len(self.todoist.calls), 1)
+        self.todoist.reject_updates = True
+        with self.assertLogs("tododolist.sync", "WARNING") as logs:
+            first = self.sync(google)
+        self.assertEqual((first.errors, first.pending), (0, 1))
+        self.assertEqual(len(logs.output), 1)
+        with self.assertNoLogs("tododolist.sync", "WARNING"):
+            second = self.sync(google)
+        self.assertEqual(second.pending, 1)
+        self.assertEqual(google.completed, [])
+
+    def test_edit_without_known_copy_id_is_reported_once(self):
+        google = FakeGoogle([task()])
+        google.fail_complete.add("one")
+        self.sync(google)
+        google.fail_complete.clear()
+        self.state.db.execute("UPDATE transfers SET todoist_id=NULL")
+        self.state.db.commit()
+        google.data["one"]["title"] = "Edited"
+        self.sync(google)
+        with self.assertNoLogs("tododolist.sync", "WARNING"):
+            self.sync(google)
+        self.assertEqual(self.todoist.updates, [])
         self.assertEqual(google.completed, [])
 
     def test_reopened_transferred_task_not_copied_again(self):
         google = FakeGoogle([task()])
         self.sync(google)
         google.data["one"]["status"] = "needsAction"
-        self.sync(google)
+        with self.assertLogs("tododolist.sync", "WARNING"):
+            self.sync(google)
+        with self.assertNoLogs("tododolist.sync", "WARNING"):
+            self.sync(google)  # Reported once, not every poll.
         self.assertEqual(len(self.todoist.calls), 1)
         self.assertEqual(len(google.completed), 1)
+
+    def test_label_added_to_every_copy(self):
+        google = FakeGoogle([task("a"), task("b")])
+        self.sync(google)
+        self.assertEqual(self.todoist.labels, ["Google Tasks"])
+        for call in self.todoist.calls:
+            self.assertEqual(call["args"]["labels"], ["Google Tasks"])
+
+    def test_blank_label_adds_none(self):
+        self.sync(FakeGoogle([task()]), label="")
+        self.assertNotIn("labels", self.todoist.calls[0]["args"])
+        self.assertEqual(self.todoist.labels, [])
+
+    def test_configured_project_used_as_destination(self):
+        self.todoist.project = "work-project"
+        self.sync(FakeGoogle([task()]))
+        self.assertEqual(self.todoist.calls[0]["args"]["project_id"], "work-project")
+
+    def test_subtasks_nested_under_parent_copy(self):
+        google = FakeGoogle(
+            [
+                task("grandchild", parent="child"),
+                task("child", parent="parent"),
+                task("parent", title="Parent"),
+            ]
+        )
+        self.sync(google)
+        by_id = {
+            c["args"]["description"].split("Google task ID: ")[1]: c for c in self.todoist.calls
+        }
+        self.assertNotIn("parent_id", by_id["parent"]["args"])
+        self.assertEqual(by_id["child"]["args"]["parent_id"], "todo-" + by_id["parent"]["uuid"])
+        self.assertEqual(by_id["grandchild"]["args"]["parent_id"], "todo-" + by_id["child"]["uuid"])
+        self.assertEqual(google.completed, ["grandchild", "child", "parent"])
+
+    def test_child_waits_when_parent_copy_fails(self):
+        google = FakeGoogle([task("parent", title="Parent"), task("child", parent="parent")])
+        self.todoist.fail_titles.add("Parent")
+        result = self.sync(google)
+        self.assertEqual(self.todoist.calls[-1]["args"]["content"], "Parent")
+        self.assertEqual(len(self.todoist.calls), 1)  # Child not copied flat.
+        self.assertEqual(result.pending, 1)
+        self.todoist.fail_titles.clear()
+        self.sync(google)
+        child = self.todoist.calls[-1]
+        self.assertEqual(child["args"]["parent_id"], "todo-" + self.todoist.calls[1]["uuid"])
+        self.assertEqual(google.completed, ["child", "parent"])
+
+    def test_completion_rereads_only_changes(self):
+        google = FakeGoogle([task("a"), task("b"), task("c")])
+        self.sync(google)
+        full_reads = [r for r in google.reads if r is None]
+        self.assertEqual(len(full_reads), 2)  # Initial read and one fresh read.
+        self.assertEqual(len([r for r in google.reads if r]), 3)  # One small read per task.
+
+    def test_auth_alert_sent_once_and_rearmed(self):
+        alert_once(self.state, self.todoist, "expired")
+        alert_once(self.state, self.todoist, "expired")
+        self.assertEqual(len(self.todoist.alerts), 1)
+        self.assertEqual(self.todoist.alerts[0]["args"]["project_id"], "inbox-id")
+        self.state.clear_alert("google-auth")
+        alert_once(self.state, self.todoist, "expired again")
+        self.assertEqual(len(self.todoist.alerts), 2)
 
     def test_rate_limit_stops_the_pass(self):
         google = FakeGoogle([task("first"), task("second")])

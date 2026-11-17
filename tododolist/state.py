@@ -27,6 +27,13 @@ class State:
             command_json TEXT NOT NULL, accepted INTEGER NOT NULL DEFAULT 0,
             todoist_id TEXT, completed INTEGER NOT NULL DEFAULT 0
         )""")
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(transfers)")}
+        if "flagged" not in columns:
+            # Upgrade older journals: marks tasks already reported for manual review.
+            self.db.execute("ALTER TABLE transfers ADD COLUMN flagged INTEGER NOT NULL DEFAULT 0")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS alerts (
+            kind TEXT PRIMARY KEY, command_json TEXT NOT NULL, sent INTEGER NOT NULL DEFAULT 0
+        )""")
         self.db.commit()
 
     def get(self, key):
@@ -44,6 +51,36 @@ class State:
         self.db.execute(
             "UPDATE transfers SET accepted=1, todoist_id=? WHERE source_key=?", (task_id, key)
         )
+        self.db.commit()
+
+    def updated(self, key, snapshot):
+        self.db.execute(
+            "UPDATE transfers SET source_json=? WHERE source_key=?",
+            (json.dumps(snapshot, sort_keys=True), key),
+        )
+        self.db.commit()
+
+    def flag(self, key):
+        self.db.execute("UPDATE transfers SET flagged=1 WHERE source_key=?", (key,))
+        self.db.commit()
+
+    def alert(self, kind):
+        return self.db.execute("SELECT * FROM alerts WHERE kind=?", (kind,)).fetchone()
+
+    def prepare_alert(self, kind, command):
+        self.db.execute(
+            "INSERT OR IGNORE INTO alerts(kind, command_json) VALUES (?, ?)",
+            (kind, json.dumps(command, sort_keys=True)),
+        )
+        self.db.commit()
+        return self.alert(kind)
+
+    def alert_sent(self, kind):
+        self.db.execute("UPDATE alerts SET sent=1 WHERE kind=?", (kind,))
+        self.db.commit()
+
+    def clear_alert(self, kind):
+        self.db.execute("DELETE FROM alerts WHERE kind=?", (kind,))
         self.db.commit()
 
     def completed(self, key):
