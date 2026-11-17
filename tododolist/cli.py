@@ -6,14 +6,16 @@ import os
 import signal
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
+from google.auth.exceptions import RefreshError, TransportError
 
 from .auth import authenticate, google_session
-from .clients import BridgeError, GoogleTasks, RateLimited, Todoist
+from .clients import AuthError, BridgeError, GoogleTasks, RateLimited, Todoist
 from .state import State
-from .sync import sync_once
+from .sync import DEFAULT_LABEL, alert_once, sync_once
 
 LOG = logging.getLogger(__name__)
 
@@ -31,6 +33,7 @@ def parser():
         "--port", type=int, default=8765, help="Local OAuth callback port (default 8765)"
     )
     commands.add_parser("lists", help="List Google task-list names and IDs")
+    commands.add_parser("health", help="Exit 0 if a recent sync pass finished (for Docker)")
     for name in ("sync", "watch"):
         command = commands.add_parser(
             name, help="Run once" if name == "sync" else "Run continuously"
@@ -40,8 +43,45 @@ def parser():
     return result
 
 
+def poll_interval():
+    interval = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
+    if interval < 15:
+        raise BridgeError("POLL_INTERVAL_SECONDS must be at least 15")
+    return interval
+
+
+def heartbeat_file(state_file):
+    return Path(os.getenv("HEARTBEAT_FILE", str(state_file.parent / "heartbeat")))
+
+
+def write_heartbeat(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(str(int(time.time())))
+    os.replace(temp, path)
+
+
+def health(state_file):
+    configured = os.getenv("HEALTH_MAX_AGE_SECONDS", "").strip()
+    limit = int(configured) if configured else max(10 * poll_interval(), 600)
+    path = heartbeat_file(state_file)
+    try:
+        age = time.time() - path.stat().st_mtime
+    except FileNotFoundError:
+        print("No sync pass has finished yet")
+        return 1
+    if age > limit:
+        print(f"Last finished sync pass was {age:.0f}s ago (limit {limit}s)")
+        return 1
+    print(f"Healthy: last sync pass finished {age:.0f}s ago")
+    return 0
+
+
 def run(args):
     token_file = Path(os.getenv("GOOGLE_TOKEN_FILE", "./data/google-token.json"))
+    state_file = Path(os.getenv("STATE_FILE", "./data/sync.sqlite3"))
+    if args.command == "health":
+        return health(state_file)
     if args.command == "auth":
         authenticate(
             Path(os.getenv("GOOGLE_CLIENT_SECRET_FILE", "./secrets/google-client-secret.json")),
@@ -67,15 +107,15 @@ def run(args):
     selection = args.selection or os.getenv("GOOGLE_TASK_LIST_ID", "@default").strip()
     if not selection:
         raise BridgeError("GOOGLE_TASK_LIST_ID must be @default, a list ID, or *")
-    interval = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
-    if interval < 15:
-        raise BridgeError("POLL_INTERVAL_SECONDS must be at least 15")
+    interval = poll_interval()
+    label = os.getenv("TODOIST_LABEL", DEFAULT_LABEL).strip()
+    heartbeat = heartbeat_file(state_file)
     stopping = threading.Event()
     if args.command == "watch":
         signal.signal(signal.SIGTERM, lambda *_: stopping.set())
         signal.signal(signal.SIGINT, lambda *_: stopping.set())
-    todoist = Todoist(token)
-    with State(Path(os.getenv("STATE_FILE", "./data/sync.sqlite3"))) as state:
+    todoist = Todoist(token, project_id=os.getenv("TODOIST_PROJECT_ID", "").strip() or None)
+    with State(state_file) as state:
         try:
             while not stopping.is_set():
                 wait = interval
@@ -83,12 +123,15 @@ def run(args):
                 try:
                     session = google_session(token_file)
                     summary = sync_once(
-                        GoogleTasks(session), todoist, state, selection, args.dry_run
+                        GoogleTasks(session), todoist, state, selection, args.dry_run, label
                     )
+                    state.clear_alert("google-auth")  # Access works again; re-arm the alert.
+                    write_heartbeat(heartbeat)
                     LOG.info(
-                        "%s: copied=%d completed=%d pending=%d errors=%d",
+                        "%s: copied=%d updated=%d completed=%d pending=%d errors=%d",
                         "Preview" if args.dry_run else "Sync",
                         summary.copied,
+                        summary.updated,
                         summary.completed,
                         summary.pending,
                         summary.errors,
@@ -100,9 +143,22 @@ def run(args):
                     if args.command == "sync":
                         raise
                     LOG.warning("%s", exc)
-                except BridgeError as exc:
+                except (AuthError, RefreshError) as exc:
+                    reason = (
+                        str(exc)
+                        if isinstance(exc, AuthError)
+                        else "Google refused the saved access; run the auth command again"
+                    )
+                    LOG.error("%s", reason)
+                    if not args.dry_run:
+                        alert_once(state, todoist, reason)
                     if args.command == "sync":
-                        raise
+                        raise AuthError(reason) from None
+                except (BridgeError, TransportError) as exc:
+                    if isinstance(exc, TransportError):
+                        exc = BridgeError("Could not reach Google; will retry")
+                    if args.command == "sync":
+                        raise exc from None
                     LOG.error("%s; retrying in %ds", exc, interval)
                 finally:
                     if session is not None:

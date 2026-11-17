@@ -4,12 +4,12 @@ import os
 import tempfile
 from pathlib import Path
 
-from google.auth.exceptions import GoogleAuthError
+from google.auth.exceptions import GoogleAuthError, TransportError
 from google.auth.transport.requests import AuthorizedSession, Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-from .clients import BridgeError
+from .clients import AuthError, BridgeError
 
 SCOPES = ["https://www.googleapis.com/auth/tasks"]
 
@@ -47,14 +47,17 @@ def authenticate(client_file: Path, token_file: Path, port=8765, open_browser=Tr
 
 def google_session(token_file: Path):
     if not token_file.is_file():
-        raise BridgeError("Google is not connected yet. Run: python -m tododolist auth")
+        raise AuthError("Google is not connected yet. Run: python -m tododolist auth")
     try:
         credentials = Credentials.from_authorized_user_file(str(token_file), SCOPES)
         if not credentials.refresh_token:
-            raise BridgeError("Google refresh token missing. Run the auth command again")
+            raise AuthError("Google refresh token missing. Run the auth command again")
         if not credentials.valid:
             credentials.refresh(Request())
             save_token(token_file, credentials)
         return AuthorizedSession(credentials)
+    except TransportError:
+        # A network problem while refreshing is temporary, not a lost authorisation.
+        raise BridgeError("Could not reach Google to refresh access; will retry") from None
     except (GoogleAuthError, ValueError, KeyError):
-        raise BridgeError("Google authorisation failed. Run the auth command again") from None
+        raise AuthError("Google authorisation failed. Run the auth command again") from None

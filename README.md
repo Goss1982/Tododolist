@@ -1,6 +1,6 @@
 # Tododolist
 
-A small background programme that moves open Google Tasks into your **Todoist Inbox**.
+A small background programme that moves open Google Tasks into your **Todoist Inbox** (or a project you choose), labelled **Google Tasks**.
 
 It copies each task's title, notes, links and due date, waits for Todoist to confirm the copy, then marks the Google task complete. You can run it once or leave it checking every 60 seconds. Docker and Coolify deployment files are included for an Ubuntu server.
 
@@ -10,7 +10,10 @@ It copies each task's title, notes, links and due date, waits for Todoist to con
 - Copies incomplete tasks, including overdue tasks and tasks without dates.
 - Keeps due **dates** exactly as returned by Google, without timezone shifts.
 - Keeps notes and available source links in the Todoist description.
-- Copies Google subtasks as separate Inbox tasks; the original parent ID is recorded in the description.
+- Keeps Google subtasks nested under their parent's Todoist copy. The original parent ID is also recorded in the description.
+- Adds the label **Google Tasks** to every copy, creating the label if needed, so they are easy to filter.
+- If you edit a Google task after it has been copied, the edit is applied to the Todoist copy before the Google task is completed.
+- Exposes a health check, and adds a high-priority reminder to Todoist if Google access expires or is revoked.
 - Completes Google tasks only after a successful Todoist copy receipt has been saved to disk.
 - Uses Todoist's idempotent Sync commands and a persistent SQLite journal so retries reuse the exact same command, including after a lost response.
 - Retries failed Google completions without creating another Todoist task.
@@ -87,7 +90,9 @@ python -m tododolist lists
 
 Keep `@default` for your default Google list. To use a different list, paste its exact ID into `GOOGLE_TASK_LIST_ID`. To include all Google task lists, set `GOOGLE_TASK_LIST_ID=*`.
 
-The destination is always the real Todoist Inbox, identified by its API flag rather than its display name. No Todoist project ID needs configuring.
+By default the destination is the real Todoist Inbox, identified by its API flag rather than its display name. To use another project, set `TODOIST_PROJECT_ID` to that project's ID (open the project in Todoist on the web; the ID is the last part of the address). Changing the destination later does not cause duplicates.
+
+Every copied task gets the label set in `TODOIST_LABEL`, which defaults to `Google Tasks`. Set it to an empty value for no label. Changing these settings affects new copies only.
 
 ## 4. Preview, transfer, then run continuously
 
@@ -109,7 +114,13 @@ python -m tododolist sync --list YOUR_LIST_ID --dry-run
 python -m tododolist sync --list '*'
 ```
 
-`sync` exits with status 1 if a task copy or completion fails. A successful preview exits with status 0. `watch` logs failures and retries on the next pass. Parent tasks waiting for children, or tasks edited during a pass, can be reported as pending. Logs show counts and source task IDs, not titles or notes.
+`sync` exits with status 1 if a task copy or completion fails. A successful preview exits with status 0. `watch` logs failures and retries on the next pass. Parent tasks waiting for children, subtasks waiting for their parent's copy, or tasks edited during a pass, can be reported as pending. Logs show counts and source task IDs, not titles or notes.
+
+## Knowing it is still working
+
+After every finished pass the programme records a heartbeat in the data folder. `python -m tododolist health` exits with status 0 if a pass finished recently and 1 otherwise. The limit is ten poll intervals, at least 600 seconds; set `HEALTH_MAX_AGE_SECONDS` to change it. The Docker image runs this check automatically, so `docker compose ps` shows the container as `unhealthy` if passes stop finishing.
+
+If Google access expires or is revoked, the programme also adds one high-priority task, **Tododolist needs re-authorising with Google**, to your Todoist destination project. It does this once per outage. After you re-authorise and a pass succeeds, the reminder is re-armed for any future outage. Complete the reminder yourself once fixed.
 
 ## Docker on your Ubuntu server
 
@@ -139,12 +150,14 @@ Stop it with `docker compose down`. Keep the `data` folder when updating or recr
 2. Set the runtime environment variables below. Store the Todoist token as a secret.
 3. Add persistent storage mounted at `/data`. Use one worker/replica and do not expose a public domain or HTTP port.
 4. Before starting the worker, securely upload your authorised `google-token.json` into that persistent storage. Make the folder and file writable by UID/GID `10001` (`700` on the directory, `600` on the file).
-5. Start the application and review its logs. Disable HTTP health checks for this background worker.
+5. Start the application and review its logs. Do not configure an HTTP health check; the image's own health check (`python -m tododolist health`) reports whether sync passes are finishing.
 
 | Variable | Value |
 | --- | --- |
 | `TODOIST_API_TOKEN` | Your Todoist personal API token |
 | `GOOGLE_TASK_LIST_ID` | `@default`, a specific Google list ID, or `*` |
+| `TODOIST_PROJECT_ID` | Blank for the Inbox, or a Todoist project ID |
+| `TODOIST_LABEL` | `Google Tasks` (blank for no label) |
 | `POLL_INTERVAL_SECONDS` | `60` |
 | `GOOGLE_TOKEN_FILE` | `/data/google-token.json` |
 | `STATE_FILE` | `/data/sync.sqlite3` |
@@ -159,7 +172,9 @@ You can also deploy `compose.yaml` with Coolify's Docker Compose mode. Replace t
 - The journal is written before sending a copy and again before completing Google. After an uncertain Todoist response the same saved command UUID is replayed, allowing Todoist to acknowledge it without another task being created.
 - Google completions use a fresh read and an `If-Match` ETag when available. The service rechecks active descendants before completing a parent, and copies all tasks in a list before starting its completions. This is not a transaction across two services: a subtask added in the narrow gap between that recheck and a parent completion cannot be atomically guarded. Avoid actively reorganising a list during a bulk transfer.
 - A failed copy leaves the Google task open. A confirmed copy with a failed Google completion is retried without recopying.
-- **Changed tasks:** if a Google task is edited after a copy was prepared or confirmed, it is left open for review. Its frozen copy request is not replaced with a new one. Find the Todoist copy using the Google task ID in its description, apply the latest details there and manually complete the Google source. This avoids silently completing an edited task whose latest details were not copied. Do not delete the journal to resolve this.
+- **Changed tasks:** if a Google task is edited after it was copied, the title, notes, links and due date of the Todoist copy are updated to match, and the Google task is then completed. The frozen copy request itself is never replaced, so this cannot create a duplicate. If the copy cannot be updated, for example because you deleted it in Todoist, the Google task is left open and reported once in the log. Find the Todoist copy using the Google task ID in its description, apply the latest details there and manually complete the Google source. Do not delete the journal to resolve this. Moving a task to a different parent in Google is not mirrored in Todoist.
+- **Reopened tasks:** a task reopened in Google after a recorded transfer is left open, not copied again, and reported once in the log.
+- **Subtasks:** a subtask is copied only once its parent's copy is confirmed, so it can be nested. If the parent copy fails, the subtask waits and is retried on the next pass. Subtasks whose parent has already been transferred are copied as top-level tasks.
 - Google does not expose recurrence rules, due times or every first-party feature through this API. Assigned tasks are requested, but availability is still subject to Google's API and account permissions. Already-completed occurrences are not imported.
 - Long Google titles are shortened to 500 characters in Todoist's title, with the complete original title included in the description. Notes are not silently truncated; a Todoist validation error leaves the source open.
 - Nothing runs in GitHub on a schedule. GitHub stores the programme and runs its automated tests; the transfer runs wherever you deploy the worker.
@@ -173,7 +188,7 @@ python -m unittest discover -s tests -v
 python -m tododolist --help
 ```
 
-Tests cover successful transfers, dates, undated tasks, pagination, assigned tasks, API errors, rate limits, lost replies, persistent retry behaviour, preview mode, process locking, subtasks, concurrent edits and reopened tasks. GitHub Actions runs the suite on Python 3.11, 3.12 and 3.13. The tests use fake services and never touch real tasks.
+Tests cover successful transfers, dates, undated tasks, pagination, assigned tasks, API errors, rate limits, lost replies, persistent retry behaviour, preview mode, process locking, nested subtasks, labels, destination projects, edits applied to copies, one-time warnings, incremental re-reads, the health check and the re-authorisation reminder. GitHub Actions runs the suite on Python 3.11, 3.12 and 3.13. The tests use fake services and never touch real tasks.
 
 ## API references
 

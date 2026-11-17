@@ -7,6 +7,7 @@ import requests
 from tododolist.clients import (
     ApiError,
     BridgeError,
+    CommandRejected,
     GoogleTasks,
     RateLimited,
     Todoist,
@@ -119,6 +120,75 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(ApiError) as raised:
             request_json(session, "Todoist", "GET", "url")
         self.assertNotIn("secret", str(raised.exception))
+
+    def test_incremental_read_includes_finished_tasks(self):
+        session = Mock()
+        session.request.return_value = response({"items": []})
+        GoogleTasks(session).tasks("list", updated_min="2026-11-17T20:00:00.000Z")
+        params = session.request.call_args.kwargs["params"]
+        self.assertEqual(params["updatedMin"], "2026-11-17T20:00:00.000Z")
+        self.assertEqual(params["showCompleted"], "true")
+        self.assertEqual(params["showDeleted"], "true")
+
+    def test_todoist_projects_read_once_and_project_validated(self):
+        session = Mock()
+        session.request.return_value = response(
+            {
+                "projects": [
+                    {"id": "inbox", "inbox_project": True},
+                    {"id": "work"},
+                    {"id": "old", "is_archived": True},
+                ],
+                "labels": [],
+            }
+        )
+        todoist = Todoist("secret", session, project_id="work")
+        self.assertEqual(todoist.destination(), "work")
+        self.assertEqual(todoist.inbox(), "inbox")
+        self.assertEqual(session.request.call_count, 1)
+        with self.assertRaisesRegex(BridgeError, "TODOIST_PROJECT_ID"):
+            Todoist("secret", session, project_id="old").destination()
+
+    def test_label_created_only_when_missing(self):
+        session = Mock()
+        sent = []
+
+        def reply(*args, **kwargs):
+            if "commands" not in kwargs["data"]:
+                return response({"projects": [], "labels": [{"name": "Other"}]})
+            command = json.loads(kwargs["data"]["commands"])[0]
+            sent.append(command)
+            return response({"sync_status": {command["uuid"]: "ok"}})
+
+        session.request.side_effect = reply
+        todoist = Todoist("secret", session)
+        todoist.ensure_label("Google Tasks")
+        todoist.ensure_label("Google Tasks")
+        self.assertEqual(
+            [(c["type"], c["args"]) for c in sent], [("label_add", {"name": "Google Tasks"})]
+        )
+        self.assertEqual(session.request.call_count, 2)
+
+    def test_existing_label_not_recreated(self):
+        session = Mock()
+        session.request.return_value = response(
+            {"projects": [], "labels": [{"name": "Google Tasks"}]}
+        )
+        Todoist("secret", session).ensure_label("Google Tasks")
+        self.assertEqual(session.request.call_count, 1)
+
+    def test_rejected_command_has_its_own_error(self):
+        session = Mock()
+        session.request.return_value = response({"sync_status": {"u": {"error_code": 22}}})
+        with self.assertRaises(CommandRejected):
+            Todoist("secret", session).execute({"type": "item_update", "uuid": "u", "args": {}})
+
+    def test_update_success_needs_no_temp_id(self):
+        session = Mock()
+        session.request.return_value = response({"sync_status": {"u": "ok"}})
+        self.assertIsNone(
+            Todoist("secret", session).execute({"type": "item_update", "uuid": "u", "args": {}})
+        )
 
 
 if __name__ == "__main__":

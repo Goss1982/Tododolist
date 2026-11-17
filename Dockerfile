@@ -11,5 +11,8 @@ COPY tododolist ./tododolist
 RUN pip install --no-cache-dir --no-deps .
 USER bridge
 VOLUME ["/data"]
+# Healthy only while sync passes keep finishing (stops if Google access is lost).
+HEALTHCHECK --interval=60s --timeout=15s --start-period=180s --retries=3 \
+    CMD ["python", "-m", "tododolist", "health"]
 ENTRYPOINT ["python", "-m", "tododolist"]
 CMD ["watch"]
